@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "cWxDqZbE72M=",
+  "success": true,
+  "projectFilePath": "/Users/reedgaines/Documents/coding/websites/netbook/netbook.csproj",
+  "expectedPackageFiles": [
+    "/Users/reedgaines/.nuget/packages/microsoft.aspnetcore.openapi/10.0.8/microsoft.aspnetcore.openapi.10.0.8.nupkg.sha512",
+    "/Users/reedgaines/.nuget/packages/microsoft.openapi/2.0.0/microsoft.openapi.2.0.0.nupkg.sha512"
+  ],
+  "logs": []
+}
