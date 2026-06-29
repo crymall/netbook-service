@@ -1,11 +1,13 @@
 using Microsoft.EntityFrameworkCore;
-using netbook_service;
+
+// using netbook_service;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
+builder.Services.AddControllers();
 
 // Configure the database
 var connectionString =
@@ -29,14 +31,6 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
-var notes = app.MapGroup("/notes");
-
-notes.MapGet(
-    "/",
-    async (NetbookDbContext db) =>
-    {
-        return await db.Notes.ToListAsync();
-    }
-);
+app.MapControllers();
 
 app.Run();
