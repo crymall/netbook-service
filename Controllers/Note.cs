@@ -1,3 +1,5 @@
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using netbook_service.Models;
@@ -6,20 +8,36 @@ namespace netbook_service.Controllers;
 
 [ApiController]
 [Route("[controller]")]
+[Authorize]
 public class NotesController(NetbookDbContext context) : ControllerBase
 {
     [HttpGet]
     public async Task<ActionResult<IEnumerable<Note>>> GetNotes()
     {
-        return await context.Notes.ToListAsync();
+        var user = await GetCurrentUserAsync();
+        if (user == null)
+        {
+            return Forbid();
+        }
+
+        var userId = user.Id.ToString();
+        return await context.Notes.Where(n => n.UserId == userId).ToListAsync();
     }
 
     [HttpGet("{id}")]
     public async Task<ActionResult<Note>> GetNote(Guid id)
     {
+        var user = await GetCurrentUserAsync();
+        if (user == null)
+        {
+            return Forbid();
+        }
+
         var note = await context.Notes.FindAsync(id);
 
-        if (note == null)
+        // Notes belonging to other users are reported as missing rather than
+        // forbidden, so callers can't probe which note ids exist.
+        if (note == null || note.UserId != user.Id.ToString())
         {
             return NotFound();
         }
@@ -30,6 +48,12 @@ public class NotesController(NetbookDbContext context) : ControllerBase
     [HttpGet("user/{userId}")]
     public async Task<ActionResult<IEnumerable<Note>>> GetNotesByUser(string userId)
     {
+        var user = await GetCurrentUserAsync();
+        if (user == null || user.Id.ToString() != userId)
+        {
+            return Forbid();
+        }
+
         var notes = await context.Notes.Where(n => n.UserId == userId).ToListAsync();
 
         return notes;
@@ -38,8 +62,15 @@ public class NotesController(NetbookDbContext context) : ControllerBase
     [HttpPost]
     public async Task<ActionResult<Note>> PostNote(Note note)
     {
+        var user = await GetCurrentUserAsync();
+        if (user == null)
+        {
+            return Forbid();
+        }
+
         note.Id = Guid.NewGuid();
         note.CreatedAt = DateTime.UtcNow;
+        note.UserId = user.Id.ToString();
 
         context.Notes.Add(note);
         await context.SaveChangesAsync();
@@ -55,23 +86,22 @@ public class NotesController(NetbookDbContext context) : ControllerBase
             return BadRequest();
         }
 
-        context.Entry(note).State = EntityState.Modified;
+        var user = await GetCurrentUserAsync();
+        if (user == null)
+        {
+            return Forbid();
+        }
 
-        try
+        var existingNote = await context.Notes.FindAsync(id);
+        if (existingNote == null || existingNote.UserId != user.Id.ToString())
         {
-            await context.SaveChangesAsync();
+            return NotFound();
         }
-        catch (DbUpdateConcurrencyException)
-        {
-            if (!NoteExists(id))
-            {
-                return NotFound();
-            }
-            else
-            {
-                throw;
-            }
-        }
+
+        existingNote.Title = note.Title;
+        existingNote.Content = note.Content;
+
+        await context.SaveChangesAsync();
 
         return NoContent();
     }
@@ -79,8 +109,14 @@ public class NotesController(NetbookDbContext context) : ControllerBase
     [HttpDelete("{id}")]
     public async Task<IActionResult> DeleteNote(Guid id)
     {
+        var user = await GetCurrentUserAsync();
+        if (user == null)
+        {
+            return Forbid();
+        }
+
         var note = await context.Notes.FindAsync(id);
-        if (note == null)
+        if (note == null || note.UserId != user.Id.ToString())
         {
             return NotFound();
         }
@@ -91,8 +127,16 @@ public class NotesController(NetbookDbContext context) : ControllerBase
         return NoContent();
     }
 
-    private bool NoteExists(Guid id)
+    // Resolves the caller to a local User row via the "id" claim iam-service
+    // puts in the JWT, which holds the IAM user's UUID (User.IamId here).
+    private async Task<User?> GetCurrentUserAsync()
     {
-        return context.Notes.Any(e => e.Id == id);
+        var iamIdClaim = User.FindFirstValue("id");
+        if (!Guid.TryParse(iamIdClaim, out var iamId))
+        {
+            return null;
+        }
+
+        return await context.Users.FirstOrDefaultAsync(u => u.IamId == iamId);
     }
 }
