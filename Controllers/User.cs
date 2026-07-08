@@ -1,11 +1,14 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using netbook_service.Attributes;
 using netbook_service.Models;
 
 namespace netbook_service.Controllers;
 
 [ApiController]
 [Route("[controller]")]
+[Authorize]
 public class UsersController(NetbookDbContext context) : ControllerBase
 {
     [HttpGet]
@@ -27,6 +30,7 @@ public class UsersController(NetbookDbContext context) : ControllerBase
         return user;
     }
 
+    [ApiKey]
     [HttpPost]
     public async Task<ActionResult<User>> PostUser(User user)
     {
@@ -65,6 +69,7 @@ public class UsersController(NetbookDbContext context) : ControllerBase
         return NoContent();
     }
 
+    [ApiKey]
     [HttpDelete("{id}")]
     public async Task<IActionResult> DeleteUser(int id)
     {
