@@ -1,0 +1,8 @@
+bin/
+obj/
+netbook-service.Tests/
+.db/
+.git/
+.github/
+.claude/
+k8s/

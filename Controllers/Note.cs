@@ -1,3 +1,4 @@
+using System.ComponentModel.DataAnnotations;
 using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -5,6 +6,16 @@ using Microsoft.EntityFrameworkCore;
 using netbook_service.Models;
 
 namespace netbook_service.Controllers;
+
+// Write DTOs: clients only ever supply title/content (plus the id echo on
+// PUT). Id, UserId, and CreatedAt are server-owned and not bindable at all.
+public record NoteCreateDto([MaxLength(200)] string Title, [MaxLength(100_000)] string Content);
+
+public record NoteUpdateDto(
+    Guid Id,
+    [MaxLength(200)] string Title,
+    [MaxLength(100_000)] string Content
+);
 
 [ApiController]
 [Route("[controller]")]
@@ -20,8 +31,7 @@ public class NotesController(NetbookDbContext context) : ControllerBase
             return Forbid();
         }
 
-        var userId = user.Id.ToString();
-        return await context.Notes.Where(n => n.UserId == userId).ToListAsync();
+        return await context.Notes.Where(n => n.UserId == user.Id).ToListAsync();
     }
 
     [HttpGet("{id}")]
@@ -37,7 +47,7 @@ public class NotesController(NetbookDbContext context) : ControllerBase
 
         // Notes belonging to other users are reported as missing rather than
         // forbidden, so callers can't probe which note ids exist.
-        if (note == null || note.UserId != user.Id.ToString())
+        if (note == null || note.UserId != user.Id)
         {
             return NotFound();
         }
@@ -45,22 +55,8 @@ public class NotesController(NetbookDbContext context) : ControllerBase
         return note;
     }
 
-    [HttpGet("user/{userId}")]
-    public async Task<ActionResult<IEnumerable<Note>>> GetNotesByUser(string userId)
-    {
-        var user = await GetCurrentUserAsync();
-        if (user == null || user.Id.ToString() != userId)
-        {
-            return Forbid();
-        }
-
-        var notes = await context.Notes.Where(n => n.UserId == userId).ToListAsync();
-
-        return notes;
-    }
-
     [HttpPost]
-    public async Task<ActionResult<Note>> PostNote(Note note)
+    public async Task<ActionResult<Note>> PostNote(NoteCreateDto dto)
     {
         var user = await GetCurrentUserAsync();
         if (user == null)
@@ -68,9 +64,14 @@ public class NotesController(NetbookDbContext context) : ControllerBase
             return Forbid();
         }
 
-        note.Id = Guid.NewGuid();
-        note.CreatedAt = DateTime.UtcNow;
-        note.UserId = user.Id.ToString();
+        var note = new Note
+        {
+            Id = Guid.NewGuid(),
+            Title = dto.Title,
+            Content = dto.Content,
+            CreatedAt = DateTime.UtcNow,
+            UserId = user.Id,
+        };
 
         context.Notes.Add(note);
         await context.SaveChangesAsync();
@@ -79,9 +80,9 @@ public class NotesController(NetbookDbContext context) : ControllerBase
     }
 
     [HttpPut("{id}")]
-    public async Task<IActionResult> PutNote(Guid id, Note note)
+    public async Task<IActionResult> PutNote(Guid id, NoteUpdateDto dto)
     {
-        if (id != note.Id)
+        if (id != dto.Id)
         {
             return BadRequest();
         }
@@ -93,13 +94,13 @@ public class NotesController(NetbookDbContext context) : ControllerBase
         }
 
         var existingNote = await context.Notes.FindAsync(id);
-        if (existingNote == null || existingNote.UserId != user.Id.ToString())
+        if (existingNote == null || existingNote.UserId != user.Id)
         {
             return NotFound();
         }
 
-        existingNote.Title = note.Title;
-        existingNote.Content = note.Content;
+        existingNote.Title = dto.Title;
+        existingNote.Content = dto.Content;
 
         await context.SaveChangesAsync();
 
@@ -116,7 +117,7 @@ public class NotesController(NetbookDbContext context) : ControllerBase
         }
 
         var note = await context.Notes.FindAsync(id);
-        if (note == null || note.UserId != user.Id.ToString())
+        if (note == null || note.UserId != user.Id)
         {
             return NotFound();
         }
@@ -129,6 +130,8 @@ public class NotesController(NetbookDbContext context) : ControllerBase
 
     // Resolves the caller to a local User row via the "id" claim iam-service
     // puts in the JWT, which holds the IAM user's UUID (User.IamId here).
+    // Rows are created only by iam-service's register-time push and the
+    // sync-users backfill script — a valid JWT with no local row gets 403.
     private async Task<User?> GetCurrentUserAsync()
     {
         var iamIdClaim = User.FindFirstValue("id");

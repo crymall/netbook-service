@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: netbook-postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netbook-postgres
+spec:
+  selector:
+    matchLabels:
+      app: netbook-postgres
+  template:
+    metadata:
+      labels:
+        app: netbook-postgres
+    spec:
+      containers:
+      - name: netbook-postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: netbook-secrets
+              key: username
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: netbook-secrets
+              key: password
+        - name: POSTGRES_DB
+          valueFrom:
+            secretKeyRef:
+              name: netbook-secrets
+              key: dbname
+        volumeMounts:
+        - mountPath: /var/lib/postgresql/data
+          name: netbook-postgres-storage
+      volumes:
+      - name: netbook-postgres-storage
+        persistentVolumeClaim:
+          claimName: netbook-postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: netbook-postgres-service
+spec:
+  ports:
+  - port: 5432
+  selector:
+    app: netbook-postgres

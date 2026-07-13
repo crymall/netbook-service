@@ -4,59 +4,116 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-`netbook-service` is the backend API for a notes app, written in C# / ASP.NET Core (.NET 10). It is a REST API only — the React frontend is a separate project not contained in this repo.
+`netbook-service` is the backend API for a notes app, written in C# / ASP.NET Core (.NET 10).
+It is a REST API only — the React frontend lives in the midden-hub monorepo (`../../midden-hub/apps/Netbook`).
+Production runs on the Midden k3s cluster behind the nginx ingress at `netbook.reedgaines.com/netbook/*`.
 
 ## Commands
 
 ```bash
-dotnet build              # Build the project
+dotnet build              # Build everything via netbook-service.sln
+dotnet test               # Run the xUnit endpoint test suite
 dotnet run                # Run the API (http://localhost:5099, https://localhost:7119)
 dotnet watch run          # Run with hot reload
 dotnet format             # Apply code style/formatting
+dotnet ef migrations add <Name>   # Add a schema migration (needs the dotnet-ef global tool)
 ```
 
-There is no test project in this repo yet.
+Local runs need a Postgres reachable via the default connection string (`Host=localhost;Port=5432;Username=netbook;Password=netbook;Database=netbook_db`), e.g.:
+
+```bash
+docker run -d --name netbook-pg -e POSTGRES_USER=netbook -e POSTGRES_PASSWORD=netbook -e POSTGRES_DB=netbook_db -p 5432:5432 postgres:15-alpine
+```
+
+Override via a `ConnectionStrings:Netbook` user secret, or via the `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD`/`DB_NAME` env vars the cluster uses.
 
 ## Architecture
 
-This is a thin, single-project Web API (no separate class libraries or solution file). Request flow: `Program.cs` → `Controllers/*` → `NetbookDbContext` → SQLite.
+This is a thin Web API plus a test project, tied together by `netbook-service.sln`.
+Request flow: `Program.cs` → `Controllers/*` → `NetbookDbContext` → PostgreSQL (Npgsql provider).
 
-- **`Program.cs`** — composition root. Configures JWT bearer auth, wires up the SQLite `NetbookDbContext`, and calls `db.Database.EnsureCreated()` on startup instead of using EF Core migrations. There is no `Migrations/` folder; schema changes are made by editing the `Models/`/`NetbookDbContext` and relying on `EnsureCreated`, which only creates a database if one doesn't exist yet (it will not apply changes to an existing `.db/Netbook.db`, so delete that file locally after model changes).
-- **`Controllers/`** — one controller per entity (`NotesController`, `UsersController`), following the standard scaffolded ASP.NET Core CRUD pattern (GET/GET by id/POST/PUT/DELETE) directly against `NetbookDbContext`. There is no service/repository layer — controllers talk to EF Core directly.
-- **`Models/`** — EF Core entities (`Note`, `User`). `Note.UserId` is a plain `string` foreign key (not a navigation property), matched against `User.Id` (an `int`) — there's no enforced relational constraint between them.
-- **`NetbookDbContext`** — defines the two `DbSet`s and seeds fixed dev data via `HasData` in `OnModelCreating` (two users, two notes).
-- **`Attributes/ApiKeyAttribute.cs`** — a custom `IAsyncActionFilter` used as `[ApiKey]` on top of `[Authorize]` for extra-sensitive endpoints (currently `POST`/`DELETE` on `UsersController`). It checks an `x-api-key` header against the `MiddenApiKey` config value (falls back to `dev_api_key` if unset).
+- **`Program.cs`** — composition root.
+  Configures JWT bearer auth, builds the connection string (`DB_*` env vars first, `ConnectionStrings:Netbook` fallback), and applies pending EF Core migrations on startup — the deployment's equivalent of the Node services' `npm run db:init && npm start`.
+  The `Testing` environment skips migration (the test factory swaps in its own database).
+  Also maps `/healthz` (health check that pings the DbContext; used by the k8s probes) and `/metrics` (prometheus-net; scraped via the Grafana pod annotations).
+  There is no `UseHttpsRedirection` — TLS terminates at the nginx ingress, and an in-app redirect would loop.
+  Ends with `public partial class Program` so the test project's `WebApplicationFactory<Program>` can see the implicit Program class.
+- **`Migrations/`** — EF Core migrations (Npgsql provider).
+  Schema changes go through `dotnet ef migrations add`, never through manual edits to a live database.
+  There is no `HasData` seeding; test data is created through the API in tests.
+- **`Controllers/`** — `NotesController` (`Controllers/Note.cs`) and `UsersController` (`Controllers/User.cs`), talking to EF Core directly (no service/repository layer).
+  Both bind write DTOs, never entities: clients cannot supply server-owned fields (`Id`, `UserId`, `CreatedAt`) at all, and request-level length limits (`MaxLength` on the DTOs) mirror the database constraints — SQLite in tests doesn't enforce varchar lengths, so the DTO validation is what the test suite exercises.
+- **`Models/`** — EF Core entities (`Note`, `User`).
+  `Note.UserId` is an `int` foreign key to `Users.Id` with `ON DELETE CASCADE` (configured in `NetbookDbContext`, no navigation properties): the database guarantees no orphaned notes and deletes a user's notes when the user row goes.
+  Column limits: `Title` varchar(200), `Content` varchar(100000), `Username` varchar(50) (matching iam's column).
+- **`NetbookDbContext`** — the two `DbSet`s, unique indexes on `User.IamId` and `User.Username`, and the `Note`→`User` cascade FK.
+- **`Attributes/ApiKeyAttribute.cs`** — `[ApiKey]` action filter checking the `x-api-key` header against the `MiddenApiKey` config value.
+  Fails closed: outside Development a missing config value returns 500 (and `Program.cs` refuses to start without it); the `dev_api_key` fallback exists only in Development.
+- **`netbook-service.Tests/`** — xUnit + `WebApplicationFactory` endpoint tests running the real pipeline against SQLite in-memory.
+  `TestWebApplicationFactory` uses `builder.UseSetting` (not `ConfigureAppConfiguration`, which applies too late for config read in top-level statements) and removes both `DbContextOptions<NetbookDbContext>` and `IDbContextOptionsConfiguration<NetbookDbContext>` when swapping providers (EF Core 9+ keeps provider config in the latter).
+  The main csproj excludes `netbook-service.Tests/**` from its compile globs because it sits at the repo root.
 
 ## Auth — this service does not own accounts
 
-`netbook-service` has no login/registration/password logic of its own. All real account management (registration, password hashing, 2FA, roles/permissions) lives in **`iam-service`**, a sibling Node/Express + Postgres project at `../midden-services/iam-service` (part of the same "Midden" family of services). `netbook-service` only *verifies* the JWT that `iam-service` already issued — it is a pure downstream consumer.
+`netbook-service` has no login/registration/password logic of its own.
+All real account management (registration, password hashing, 2FA, roles/permissions) lives in **`iam-service`**, a sibling Node/Express + Postgres project at `../iam-service` (part of the same "Midden" family of services).
+`netbook-service` only *verifies* the JWT that `iam-service` already issued — it is a pure downstream consumer.
 
 - All controllers are `[Authorize]` by default, expecting a JWT bearer token.
 - The JWT handler also accepts the token from a `token` cookie (see `OnMessageReceived` in `Program.cs`) — this matches `iam-service`'s `routes/auth.js`, which sets an httpOnly cookie named `token` on `/verify-2fa` login.
-- **Shared secret, not a shared library**: the signing key comes from `Jwt:Secret` in configuration; `iam-service` signs tokens with `process.env.JWT_SECRET`. There is **no fallback secret** — this service throws at startup if `Jwt:Secret` is unset, and `iam-service`/`canteen-service` exit at startup (`bin/www`) if `JWT_SECRET` is unset. The two services aren't calling each other at request time to validate tokens — they just both need to be configured with the *same* secret. If auth ever breaks between the two, check for a secret mismatch first.
-- **Local dev config**: the Node services read `JWT_SECRET` from their gitignored `.env` files; this service stores `Jwt:Secret` in `dotnet user-secrets` (the `UserSecretsId` is in the csproj). To (re)set it: `dotnet user-secrets set "Jwt:Secret" "<same value as iam-service's .env JWT_SECRET>"`. Never commit the secret to `appsettings*.json`.
+- **Shared secret, not a shared library**: the signing key comes from `Jwt:Secret` in configuration; `iam-service` signs tokens with `process.env.JWT_SECRET`.
+  There is **no fallback secret** — this service throws at startup if `Jwt:Secret` is unset.
+  In the cluster both come from the `midden-global-secrets` secret (`jwt_secret` key), so they cannot drift.
+  If auth ever breaks between the two, check for a secret mismatch first.
+- **Local dev config**: the Node services read `JWT_SECRET` from their gitignored `.env` files; this service stores `Jwt:Secret` in `dotnet user-secrets` (the `UserSecretsId` is in the csproj).
+  To (re)set it: `dotnet user-secrets set "Jwt:Secret" "<same value as iam-service's .env JWT_SECRET>"`.
+  Never commit the secret to `appsettings*.json`.
 - `issuer`/`audience` validation are both disabled, so trust is entirely a function of secret possession.
-- `iam-service` embeds `role` and a `permissions` array in the JWT payload (see its `authorizePermissions` middleware). `netbook-service` currently does not read or enforce either claim — it only checks that the token is valid, not what the caller is allowed to do.
-- **User sync, not shared DB**: `iam-service`'s `/register` and user-deletion routes call out to sub-app APIs with `POST/DELETE .../users` plus an `x-api-key: MIDDEN_API_KEY` header, passing `{ username, iam_id }`. This is the same shape as `netbook-service`'s `ApiKeyAttribute` (`x-api-key` header, `MiddenApiKey` config) guarding `POST/DELETE /users`, and matches `User.IamId`/`User.Username` in `Models/User.cs`. In other words, `netbook-service`'s local `Users` table is a thin mirror keyed by `IamId`, kept in sync by `iam-service` pushing changes — not a source of truth and not queried by `iam-service` directly.
-- The `dev_api_key` fallback for `MiddenApiKey` (and `MIDDEN_API_KEY` in the Node services) still exists and is not safe for production — override it via configuration/secrets before deploying, matching whatever `iam-service` is configured with.
-- **Secret length matters on this side**: .NET's JWT validator requires the HS256 key to be ≥128 bits — a shorter `Jwt:Secret` is silently excluded and every token fails with `WWW-Authenticate: ... "The signature key was not found"`. Node signs with short keys without complaint, so a too-short shared secret makes `iam-service` appear to work while `netbook-service` rejects everything. Use 32+ bytes.
+- **Secret length matters on this side**: .NET's JWT validator requires the HS256 key to be ≥128 bits — a shorter `Jwt:Secret` is silently excluded and every token fails with `WWW-Authenticate: ... "The signature key was not found"`.
+  Node signs with short keys without complaint, so a too-short shared secret makes `iam-service` appear to work while `netbook-service` rejects everything.
+  Use 32+ bytes.
+
+## User sync — push from iam, no local provisioning
+
+The local `Users` table is a mirror keyed by `IamId`, maintained entirely by `iam-service` pushes; it is not a source of truth.
+There is **no just-in-time provisioning**: a validly signed JWT whose `id` claim has no local `Users` row gets `403` from every notes endpoint.
+
+- `iam-service` pushes on registration (`POST /users` with `{ username, iam_id }`) and deletion (`DELETE /users/sync/:iamId`) to every URL in its `USER_SYNC_API_URLS` env var (comma-separated; this service is `http://netbook-service:8080` in the cluster).
+- The whole `UsersController` is a machine surface: `[ApiKey]` at class level, no JWT, no browser-facing endpoints.
+  The surface is exactly `GET /users/{id}`, `POST /users`, and `DELETE /users/sync/{iamId}` — there is deliberately no list endpoint, no PUT, and no by-local-id delete.
+- `POST /users` binds `UserSyncDto` (`[JsonPropertyName("iam_id")]` — default binding would silently drop the snake_case key) and is **idempotent**: an already-synced `IamId` returns `200` with the existing row.
+  A taken username under a *different* `IamId` returns `409` — that means the mirror is stale (missed deletion sync); reconcile with the sync script.
+- User deletion cascades to the user's notes at the database level (FK `ON DELETE CASCADE`).
+- Backfill/reconciliation: `midden-infra/scripts/sync-users.js` pulls the user list from iam's api-key-guarded `GET /users/sync` and pushes each user here; safe to re-run.
 
 ## Note permissions
 
-Every `NotesController` action is scoped to the caller's own notes. The ownership model:
-- If a note is yours (`Note.UserId` matches the caller), you're effectively its editor — no separate roles/permissions within a note.
-- If a note isn't yours, it's completely inaccessible. (If note sharing is ever built, "not yours" could become read-only instead — but sharing is **not on the roadmap right now**.)
-- This is unrelated to the `role`/`permissions` claims `iam-service` puts on the JWT (see above) — those describe IAM-level roles, not note-level ownership, and don't factor into note access.
+Every `NotesController` action is scoped to the caller's own notes.
+The ownership model:
 
-How the caller is resolved (`GetCurrentUserAsync` in `NotesController`): the JWT's `id` claim (the IAM user's UUID, set by `iam-service`) → local `Users` row via `User.IamId` → `User.Id.ToString()` compared against `Note.UserId`. A valid JWT whose IAM id has no local `Users` row gets `403` — the user hasn't been synced (see user-sync above).
+- If a note is yours (`Note.UserId` matches the caller), you're effectively its editor — no separate roles/permissions within a note.
+- If a note isn't yours, it's completely inaccessible.
+  (If note sharing is ever built, "not yours" could become read-only instead — but sharing is **not on the roadmap right now**.)
+- This is unrelated to the `role`/`permissions` claims `iam-service` puts on the JWT — those describe IAM-level roles, not note-level ownership, and don't factor into note access.
+
+How the caller is resolved (`GetCurrentUserAsync` in `Controllers/Note.cs`): the JWT's `id` claim (the IAM user's UUID) → local `Users` row via `User.IamId` → `User.Id` compared against `Note.UserId`.
+No row means `403` (see the user-sync section above).
 
 Enforcement conventions:
+
 - `GET`/`PUT`/`DELETE` on someone else's note returns **404, not 403**, so callers can't probe which note ids exist.
-- `POST /notes` ignores any client-supplied `UserId` and stamps the caller's — same for `Id` and `CreatedAt`.
-- `GET /notes` returns only the caller's notes; `GET /notes/user/{userId}` returns 403 unless `userId` is the caller's own.
+- `POST /notes` binds only `title`/`content` (`NoteCreateDto`) — `Id`, `UserId`, and `CreatedAt` are stamped server-side and extra JSON keys are ignored.
+- `GET /notes` returns only the caller's notes.
+  (The old `GET /notes/user/{userId}` was redundant with it and was removed; the frontend never used it.)
+
+## Deployment
+
+- **CI** (`.github/workflows/ci.yml`): `dotnet test` on PRs to main.
+- **Deploy** (`.github/workflows/deploy.yml`): on merge to main — test, build/push `crymall/netbook-server:<sha>` to Docker Hub, `kubectl apply -f k8s/`, wait for rollout.
+- **k8s/**: `server-deployment.yaml` (port 8080, `/healthz` probes, Grafana scrape annotations, env from `netbook-secrets` + `midden-global-secrets`), `postgres.yaml` (PVC-backed postgres:15-alpine), `server-ingress.yaml` (`netbook.reedgaines.com`, `/netbook(/|$)(.*)` rewrite, own `netbook-tls-secret`), `netbook-backup-cronjob.yaml` (nightly 02:45 pg_dump to Linode Object Storage with healthchecks.io heartbeat).
+- Cluster-scoped concerns (ClusterIssuer, secrets inventory, backup alerting) live in `midden-infra`, not here.
 
 ## Frontend integration notes
 
-The upcoming React frontend will consume this API as a separate client. Keep in mind when changing endpoints:
-- Auth is cookie- or bearer-token-based (see above) — CORS and cookie settings (`SameSite`, `Secure`) will need attention once a separate frontend origin is introduced, since no CORS policy is currently configured in `Program.cs`.
-- `POST /users` and `DELETE /users/{id}` require the `x-api-key` header in addition to a valid JWT.
+The React frontend (midden-hub `apps/Netbook`) consumes this API through the `/netbook` path prefix — the Vite dev proxy and the production ingress both strip it.
+Auth is cookie-based via iam-service on the same host, so no CORS policy is configured; requests arrive same-origin.

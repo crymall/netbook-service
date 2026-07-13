@@ -1,0 +1,66 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: netbook-postgres-backup
+spec:
+  schedule: "45 2 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: backup
+            image: postgres:15
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              apt-get update && apt-get install -y s3cmd curl
+              cat <<EOF > ~/.s3cfg
+              [default]
+              access_key = $AWS_ACCESS_KEY_ID
+              secret_key = $AWS_SECRET_ACCESS_KEY
+              host_base = us-east-1.linodeobjects.com
+              host_bucket = %(bucket)s.us-east-1.linodeobjects.com
+              use_https = True
+              EOF
+              FILE_NAME="netbook_db_backup_$(date +%Y%m%d_%H%M%S).sql.gz"
+              pg_dump -h netbook-postgres-service -U "$DB_USER" -d "$DB_NAME" | gzip > /tmp/$FILE_NAME
+              s3cmd put /tmp/$FILE_NAME s3://midden-db-backups/netbook-service/$FILE_NAME
+              if [ -n "${HEARTBEAT_URL:-}" ]; then
+                curl -fsS -m 10 --retry 3 "$HEARTBEAT_URL"
+              fi
+            env:
+            - name: HEARTBEAT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: backup-heartbeat
+                  key: netbook_ping_url
+                  optional: true
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: netbook-secrets
+                  key: username
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: netbook-secrets
+                  key: dbname
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: netbook-secrets
+                  key: password
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: s3-backup-secret
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: s3-backup-secret
+                  key: AWS_SECRET_ACCESS_KEY
+          restartPolicy: OnFailure
