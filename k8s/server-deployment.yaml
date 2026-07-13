@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netbook-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: netbook-server
+  template:
+    metadata:
+      labels:
+        app: netbook-server
+      annotations:
+          k8s.grafana.com/scrape: "true"
+          k8s.grafana.com/metrics.portNumber: "8080"
+          k8s.grafana.com/metrics.path: "/metrics"
+    spec:
+      containers:
+      - name: netbook-server
+        image: crymall/netbook-server:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        env:
+        - name: ASPNETCORE_ENVIRONMENT
+          value: Production
+        - name: DB_HOST
+          value: "netbook-postgres-service"
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: netbook-secrets
+              key: username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: netbook-secrets
+              key: password
+        - name: DB_NAME
+          valueFrom:
+            secretKeyRef:
+              name: netbook-secrets
+              key: dbname
+        - name: Jwt__Secret
+          valueFrom:
+            secretKeyRef:
+              name: midden-global-secrets
+              key: jwt_secret
+        - name: MiddenApiKey
+          valueFrom:
+            secretKeyRef:
+              name: midden-global-secrets
+              key: midden_api_key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: netbook-service
+spec:
+  ports:
+  - port: 8080
+  selector:
+    app: netbook-server

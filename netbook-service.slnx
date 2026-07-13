@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="netbook-service.csproj" />
+  <Project Path="netbook-service.Tests/netbook-service.Tests.csproj" />
+</Solution>

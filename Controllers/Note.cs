@@ -129,6 +129,8 @@ public class NotesController(NetbookDbContext context) : ControllerBase
 
     // Resolves the caller to a local User row via the "id" claim iam-service
     // puts in the JWT, which holds the IAM user's UUID (User.IamId here).
+    // Rows are created only by iam-service's register-time push and the
+    // sync-users backfill script — a valid JWT with no local row gets 403.
     private async Task<User?> GetCurrentUserAsync()
     {
         var iamIdClaim = User.FindFirstValue("id");

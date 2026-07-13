@@ -2,8 +2,7 @@ using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
-
-// using netbook_service;
+using Prometheus;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -29,7 +28,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateIssuer = false,
             ValidateAudience = false
         };
-        
+
         options.Events = new JwtBearerEvents
         {
             OnMessageReceived = context =>
@@ -43,18 +42,32 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         };
     });
 
-// Configure the database
-var connectionString =
-    builder.Configuration.GetConnectionString("Netbook") ?? "Data Source=.db/Netbook.db";
-builder.Services.AddSqlite<NetbookDbContext>(connectionString);
+// Configure the database. In the cluster the DB_* env vars come from
+// netbook-secrets (same convention as iam-service/canteen-service); locally
+// the ConnectionStrings:Netbook fallback points at a dev Postgres.
+var dbHost = builder.Configuration["DB_HOST"];
+var connectionString = dbHost != null
+    ? $"Host={dbHost};"
+        + $"Port={builder.Configuration["DB_PORT"] ?? "5432"};"
+        + $"Username={builder.Configuration["DB_USER"]};"
+        + $"Password={builder.Configuration["DB_PASSWORD"]};"
+        + $"Database={builder.Configuration["DB_NAME"]}"
+    : builder.Configuration.GetConnectionString("Netbook")
+        ?? "Host=localhost;Port=5432;Username=netbook;Password=netbook;Database=netbook_db";
+builder.Services.AddDbContext<NetbookDbContext>(options => options.UseNpgsql(connectionString));
+
+builder.Services.AddHealthChecks().AddDbContextCheck<NetbookDbContext>();
 
 var app = builder.Build();
 
-// Ensure the database is created and seeded on startup - DELETE AFTER PROTOTYPING
-using (var scope = app.Services.CreateScope())
+// Apply pending migrations on startup — the deployment's equivalent of the
+// Node services' "npm run db:init && npm start". The test host swaps in its
+// own database, so it skips this.
+if (!app.Environment.IsEnvironment("Testing"))
 {
+    using var scope = app.Services.CreateScope();
     var db = scope.ServiceProvider.GetRequiredService<NetbookDbContext>();
-    db.Database.EnsureCreated();
+    db.Database.Migrate();
 }
 
 // Configure the HTTP request pipeline.
@@ -63,11 +76,19 @@ if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 }
 
-app.UseHttpsRedirection();
+// No UseHttpsRedirection: TLS terminates at the nginx ingress, which forwards
+// plain HTTP to the pod — an in-app redirect would loop.
 
 app.UseAuthentication();
 app.UseAuthorization();
 
+app.UseHttpMetrics();
+
 app.MapControllers();
+app.MapMetrics();
+app.MapHealthChecks("/healthz");
 
 app.Run();
+
+// Exposes the implicit Program class to WebApplicationFactory in the test project.
+public partial class Program { }
