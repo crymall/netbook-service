@@ -13,9 +13,26 @@ public class ApiKeyAttribute : Attribute, IAsyncActionFilter
         ActionExecutionDelegate next
     )
     {
-        var configuration =
-            context.HttpContext.RequestServices.GetRequiredService<IConfiguration>();
-        var validApiKey = configuration["MiddenApiKey"] ?? "dev_api_key";
+        var services = context.HttpContext.RequestServices;
+        var configuration = services.GetRequiredService<IConfiguration>();
+        var validApiKey = configuration["MiddenApiKey"];
+
+        // Fail closed: outside Development, a missing key is a deployment
+        // error, never an open door. (Program.cs also refuses to start
+        // without it; this is defense in depth.)
+        if (string.IsNullOrEmpty(validApiKey))
+        {
+            var environment = services.GetRequiredService<IHostEnvironment>();
+            if (!environment.IsDevelopment())
+            {
+                context.Result = new ObjectResult(new { error = "Service misconfigured" })
+                {
+                    StatusCode = StatusCodes.Status500InternalServerError,
+                };
+                return;
+            }
+            validApiKey = "dev_api_key";
+        }
 
         if (
             !context.HttpContext.Request.Headers.TryGetValue(

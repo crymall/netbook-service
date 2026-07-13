@@ -20,22 +20,37 @@ public class NotesTests(TestWebApplicationFactory factory)
         var (client, user) = await AuthedClientAsync("stamp_user");
         using var _ = client;
 
+        // Extra JSON keys for server-owned fields are ignored — the write DTO
+        // doesn't bind them at all.
         var forgedId = Guid.NewGuid();
         var response = await client.PostAsJsonAsync("/notes", new
         {
             id = forgedId,
             title = "Groceries",
             content = "Eggs, flour",
-            userId = "999",
+            userId = 999,
             createdAt = new DateTime(2000, 1, 1, 0, 0, 0, DateTimeKind.Utc),
         });
 
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var note = (await response.Content.ReadFromJsonAsync<Note>())!;
         Assert.NotEqual(forgedId, note.Id);
-        Assert.Equal(user.Id.ToString(), note.UserId);
+        Assert.Equal(user.Id, note.UserId);
         Assert.True(note.CreatedAt > DateTime.UtcNow.AddMinutes(-1));
         Assert.Equal("Groceries", note.Title);
+    }
+
+    [Fact]
+    public async Task PostNote_OverlongTitle_IsBadRequest()
+    {
+        var (client, _) = await AuthedClientAsync("verbose_user");
+        using var _c = client;
+        var response = await client.PostAsJsonAsync("/notes", new
+        {
+            title = new string('x', 201),
+            content = "c",
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 
     [Fact]
@@ -131,22 +146,13 @@ public class NotesTests(TestWebApplicationFactory factory)
     }
 
     [Fact]
-    public async Task GetNotesByUser_OtherUsersId_ReturnsForbidden()
+    public async Task NotesUserRoute_IsGone()
     {
-        var (client, _) = await AuthedClientAsync("nosy_user");
-        var (_, victim) = await AuthedClientAsync("victim_user");
+        var (client, user) = await AuthedClientAsync("route_check");
         using var _c = client;
-        var response = await client.GetAsync($"/notes/user/{victim.Id}");
-        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-    }
-
-    [Fact]
-    public async Task GetNotesByUser_OwnId_ReturnsNotes()
-    {
-        var (client, user) = await AuthedClientAsync("self_user");
-        using var _c = client;
-        await client.PostAsJsonAsync("/notes", new { title = "mine", content = "m" });
-        var notes = (await client.GetFromJsonAsync<List<Note>>($"/notes/user/{user.Id}"))!;
-        Assert.Single(notes);
+        var response = await client.GetAsync($"/notes/user/{user.Id}");
+        // The old per-user listing was redundant with GET /notes and is
+        // removed; /notes/user/{id} no longer parses as a note id either.
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
     }
 }

@@ -47,9 +47,10 @@ The sync endpoints take api-key only — no JWT needed.)
 
 - `GET/POST/PUT/DELETE /notes` with a synced user — ownership scoping (cross-user access must 404, not 403).
 - A token with an unsynced IAM UUID — every notes endpoint must 403.
-- `POST /notes` with client-supplied `id`/`userId`/`createdAt` — all must be overridden server-side.
-- `POST /users` twice with the same `iam_id` — second call must return 200 with the same row (idempotent), not 500.
-- `DELETE /users/sync/{iamId}` — must remove the user's notes too (no FK cascade exists).
+- `POST /notes` with client-supplied `id`/`userId`/`createdAt` — the write DTO ignores them; the response must show server-stamped values.
+- `POST /notes` with a title over 200 chars or content over 100k — 400 from DTO validation (the varchar limits also exist in Postgres, but SQLite tests only see the DTO layer).
+- `POST /users` twice with the same `iam_id` — second call must return 200 with the same row (idempotent), not 500; same username under a different `iam_id` must 409.
+- `DELETE /users/sync/{iamId}` — the user's notes must vanish too (FK `ON DELETE CASCADE`, enforced by Postgres itself).
 
 ## Full-stack option
 

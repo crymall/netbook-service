@@ -42,16 +42,33 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         };
     });
 
+// Outside Development, an unset MiddenApiKey must stop the pod at startup,
+// not fall back to the dev key (the ApiKey filter also fails closed).
+if (
+    !builder.Environment.IsDevelopment()
+    && !builder.Environment.IsEnvironment("Testing")
+    && string.IsNullOrEmpty(builder.Configuration["MiddenApiKey"])
+)
+{
+    throw new InvalidOperationException(
+        "MiddenApiKey is not configured. Set it to the same value as iam-service's MIDDEN_API_KEY."
+    );
+}
+
 // Configure the database. In the cluster the DB_* env vars come from
 // netbook-secrets (same convention as iam-service/canteen-service); locally
-// the ConnectionStrings:Netbook fallback points at a dev Postgres.
+// the ConnectionStrings:Netbook fallback points at a dev Postgres. The
+// builder handles quoting, so generated passwords can contain any character.
 var dbHost = builder.Configuration["DB_HOST"];
-var connectionString = dbHost != null
-    ? $"Host={dbHost};"
-        + $"Port={builder.Configuration["DB_PORT"] ?? "5432"};"
-        + $"Username={builder.Configuration["DB_USER"]};"
-        + $"Password={builder.Configuration["DB_PASSWORD"]};"
-        + $"Database={builder.Configuration["DB_NAME"]}"
+var connectionString = !string.IsNullOrEmpty(dbHost)
+    ? new Npgsql.NpgsqlConnectionStringBuilder
+    {
+        Host = dbHost,
+        Port = int.TryParse(builder.Configuration["DB_PORT"], out var dbPort) ? dbPort : 5432,
+        Username = builder.Configuration["DB_USER"],
+        Password = builder.Configuration["DB_PASSWORD"],
+        Database = builder.Configuration["DB_NAME"],
+    }.ConnectionString
     : builder.Configuration.GetConnectionString("Netbook")
         ?? "Host=localhost;Port=5432;Username=netbook;Password=netbook;Database=netbook_db";
 builder.Services.AddDbContext<NetbookDbContext>(options => options.UseNpgsql(connectionString));

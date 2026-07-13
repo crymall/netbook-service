@@ -1,5 +1,5 @@
+using System.ComponentModel.DataAnnotations;
 using System.Text.Json.Serialization;
-using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using netbook_service.Attributes;
@@ -10,21 +10,18 @@ namespace netbook_service.Controllers;
 // The body iam-service sends when pushing a user (snake_case keys).
 public record UserSyncDto(
     [property: JsonPropertyName("iam_id")] Guid IamId,
-    [property: JsonPropertyName("username")] string Username
+    [property: JsonPropertyName("username")] [MaxLength(50)] string Username
 );
 
+// This controller is a machine-to-machine sync surface for iam-service and
+// the midden-infra backfill script only — no browser-facing endpoints, so no
+// JWT auth; the x-api-key check is the whole story.
 [ApiController]
 [Route("[controller]")]
-[Authorize]
+[ApiKey]
 public class UsersController(NetbookDbContext context) : ControllerBase
 {
-    [HttpGet]
-    public async Task<ActionResult<IEnumerable<User>>> GetUsers()
-    {
-        return await context.Users.ToListAsync();
-    }
-
-    [HttpGet("{id}")]
+    [HttpGet("{id:int}")]
     public async Task<ActionResult<User>> GetUser(int id)
     {
         var user = await context.Users.FindAsync(id);
@@ -40,10 +37,6 @@ public class UsersController(NetbookDbContext context) : ControllerBase
     // Receives user pushes from iam-service (register-time sync and the
     // backfill script). Idempotent: pushing an already-synced user returns
     // the existing row instead of erroring, so retries and re-runs are safe.
-    // iam-service authenticates with x-api-key only (no JWT), hence
-    // AllowAnonymous — the ApiKey filter is the auth on the sync surface.
-    [AllowAnonymous]
-    [ApiKey]
     [HttpPost]
     public async Task<ActionResult<User>> PostUser(UserSyncDto dto)
     {
@@ -66,19 +59,27 @@ public class UsersController(NetbookDbContext context) : ControllerBase
         }
         catch (DbUpdateException)
         {
+            context.Entry(user).State = EntityState.Detached;
+
             // A concurrent push won the unique-index race on IamId; return
             // the row it created.
-            context.Entry(user).State = EntityState.Detached;
-            existing = await context.Users.FirstAsync(u => u.IamId == dto.IamId);
-            return Ok(existing);
+            existing = await context.Users.FirstOrDefaultAsync(u => u.IamId == dto.IamId);
+            if (existing != null)
+            {
+                return Ok(existing);
+            }
+
+            // Otherwise the username is taken by a different IAM account —
+            // a stale mirror row from a missed deletion sync. Surface it;
+            // reconcile with the sync-users script rather than guessing here.
+            return Conflict(new { error = $"Username '{dto.Username}' is already taken." });
         }
 
         return CreatedAtAction(nameof(GetUser), new { id = user.Id }, user);
     }
 
     // The deletion path iam-service actually calls: DELETE /users/sync/:iamId.
-    [AllowAnonymous]
-    [ApiKey]
+    // Notes cascade at the database level via the Notes.UserId foreign key.
     [HttpDelete("sync/{iamId:guid}")]
     public async Task<IActionResult> DeleteUserByIamId(Guid iamId)
     {
@@ -88,32 +89,8 @@ public class UsersController(NetbookDbContext context) : ControllerBase
             return NotFound();
         }
 
-        await RemoveUserWithNotesAsync(user);
-        return NoContent();
-    }
-
-    [AllowAnonymous]
-    [ApiKey]
-    [HttpDelete("{id:int}")]
-    public async Task<IActionResult> DeleteUser(int id)
-    {
-        var user = await context.Users.FindAsync(id);
-        if (user == null)
-        {
-            return NotFound();
-        }
-
-        await RemoveUserWithNotesAsync(user);
-        return NoContent();
-    }
-
-    // Note.UserId is a plain string column with no FK, so the user's notes
-    // must be removed explicitly — the database won't cascade for us.
-    private async Task RemoveUserWithNotesAsync(User user)
-    {
-        var userId = user.Id.ToString();
-        await context.Notes.Where(n => n.UserId == userId).ExecuteDeleteAsync();
         context.Users.Remove(user);
         await context.SaveChangesAsync();
+        return NoContent();
     }
 }

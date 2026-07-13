@@ -17,6 +17,24 @@ public class UsersSyncTests(TestWebApplicationFactory factory)
     }
 
     [Fact]
+    public async Task GetUser_WithoutApiKey_IsRejected()
+    {
+        // The whole controller is a machine surface — even reads need the key.
+        var user = await TestHelpers.SyncUserAsync(factory, Guid.NewGuid(), "hidden");
+        using var client = factory.CreateClient();
+        var response = await client.GetAsync($"/users/{user.Id}");
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task UsersList_IsGone()
+    {
+        using var client = factory.CreateClient().WithApiKey();
+        var response = await client.GetAsync("/users");
+        Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
+    }
+
+    [Fact]
     public async Task PostUser_BindsSnakeCaseIamId()
     {
         // iam-service sends { username, iam_id } — the exact wire shape.
@@ -51,11 +69,34 @@ public class UsersSyncTests(TestWebApplicationFactory factory)
     }
 
     [Fact]
+    public async Task PostUser_TakenUsernameDifferentIamId_IsConflict()
+    {
+        using var client = factory.CreateClient().WithApiKey();
+
+        var first = await client.PostAsJsonAsync(
+            "/users", new { username = "highlander", iam_id = Guid.NewGuid() });
+        Assert.Equal(HttpStatusCode.Created, first.StatusCode);
+
+        var second = await client.PostAsJsonAsync(
+            "/users", new { username = "highlander", iam_id = Guid.NewGuid() });
+        Assert.Equal(HttpStatusCode.Conflict, second.StatusCode);
+    }
+
+    [Fact]
     public async Task PostUser_EmptyIamId_IsBadRequest()
     {
         using var client = factory.CreateClient().WithApiKey();
         var response = await client.PostAsJsonAsync(
             "/users", new { username = "noguid", iam_id = Guid.Empty });
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PostUser_OverlongUsername_IsBadRequest()
+    {
+        using var client = factory.CreateClient().WithApiKey();
+        var response = await client.PostAsJsonAsync(
+            "/users", new { username = new string('u', 51), iam_id = Guid.NewGuid() });
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 
@@ -98,25 +139,17 @@ public class UsersSyncTests(TestWebApplicationFactory factory)
     }
 
     [Fact]
-    public async Task GetUsers_RequiresJwt()
-    {
-        using var anonymous = factory.CreateClient();
-        var response = await anonymous.GetAsync("/users");
-        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
-
-        var user = await TestHelpers.SyncUserAsync(factory, Guid.NewGuid(), "lister");
-        using var authed = factory.CreateClient().WithBearer(user.IamId, user.Username);
-        var ok = await authed.GetAsync("/users");
-        Assert.Equal(HttpStatusCode.OK, ok.StatusCode);
-    }
-
-    [Fact]
-    public async Task PutUser_IsGone()
+    public async Task PutAndPlainDelete_AreGone()
     {
         var user = await TestHelpers.SyncUserAsync(factory, Guid.NewGuid(), "immutable");
-        using var client = factory.CreateClient().WithBearer(user.IamId, user.Username);
-        var response = await client.PutAsJsonAsync(
-            $"/users/{user.Id}", new { id = user.Id, iamId = user.IamId, username = "hacked" });
-        Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
+        using var client = factory.CreateClient().WithApiKey();
+
+        var put = await client.PutAsJsonAsync(
+            $"/users/{user.Id}", new { id = user.Id, username = "hacked" });
+        Assert.Equal(HttpStatusCode.MethodNotAllowed, put.StatusCode);
+
+        // Deletion goes through the iam-id sync route only.
+        var del = await client.DeleteAsync($"/users/{user.Id}");
+        Assert.Equal(HttpStatusCode.MethodNotAllowed, del.StatusCode);
     }
 }

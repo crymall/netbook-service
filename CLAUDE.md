@@ -42,10 +42,13 @@ Request flow: `Program.cs` → `Controllers/*` → `NetbookDbContext` → Postgr
   Schema changes go through `dotnet ef migrations add`, never through manual edits to a live database.
   There is no `HasData` seeding; test data is created through the API in tests.
 - **`Controllers/`** — `NotesController` (`Controllers/Note.cs`) and `UsersController` (`Controllers/User.cs`), talking to EF Core directly (no service/repository layer).
+  Both bind write DTOs, never entities: clients cannot supply server-owned fields (`Id`, `UserId`, `CreatedAt`) at all, and request-level length limits (`MaxLength` on the DTOs) mirror the database constraints — SQLite in tests doesn't enforce varchar lengths, so the DTO validation is what the test suite exercises.
 - **`Models/`** — EF Core entities (`Note`, `User`).
-  `Note.UserId` is a plain `string` matched against `User.Id` (an `int`); there is no enforced relational constraint, which is why user deletion explicitly deletes the user's notes.
-- **`NetbookDbContext`** — the two `DbSet`s plus a unique index on `User.IamId`.
-- **`Attributes/ApiKeyAttribute.cs`** — `[ApiKey]` action filter checking the `x-api-key` header against the `MiddenApiKey` config value (falls back to `dev_api_key`; override in any real deployment).
+  `Note.UserId` is an `int` foreign key to `Users.Id` with `ON DELETE CASCADE` (configured in `NetbookDbContext`, no navigation properties): the database guarantees no orphaned notes and deletes a user's notes when the user row goes.
+  Column limits: `Title` varchar(200), `Content` varchar(100000), `Username` varchar(50) (matching iam's column).
+- **`NetbookDbContext`** — the two `DbSet`s, unique indexes on `User.IamId` and `User.Username`, and the `Note`→`User` cascade FK.
+- **`Attributes/ApiKeyAttribute.cs`** — `[ApiKey]` action filter checking the `x-api-key` header against the `MiddenApiKey` config value.
+  Fails closed: outside Development a missing config value returns 500 (and `Program.cs` refuses to start without it); the `dev_api_key` fallback exists only in Development.
 - **`netbook-service.Tests/`** — xUnit + `WebApplicationFactory` endpoint tests running the real pipeline against SQLite in-memory.
   `TestWebApplicationFactory` uses `builder.UseSetting` (not `ConfigureAppConfiguration`, which applies too late for config read in top-level statements) and removes both `DbContextOptions<NetbookDbContext>` and `IDbContextOptionsConfiguration<NetbookDbContext>` when swapping providers (EF Core 9+ keeps provider config in the latter).
   The main csproj excludes `netbook-service.Tests/**` from its compile globs because it sits at the repo root.
@@ -76,9 +79,11 @@ The local `Users` table is a mirror keyed by `IamId`, maintained entirely by `ia
 There is **no just-in-time provisioning**: a validly signed JWT whose `id` claim has no local `Users` row gets `403` from every notes endpoint.
 
 - `iam-service` pushes on registration (`POST /users` with `{ username, iam_id }`) and deletion (`DELETE /users/sync/:iamId`) to every URL in its `USER_SYNC_API_URLS` env var (comma-separated; this service is `http://netbook-service:8080` in the cluster).
-- Both sync endpoints are `[AllowAnonymous]` + `[ApiKey]`: iam authenticates with the `x-api-key` header only, no JWT.
+- The whole `UsersController` is a machine surface: `[ApiKey]` at class level, no JWT, no browser-facing endpoints.
+  The surface is exactly `GET /users/{id}`, `POST /users`, and `DELETE /users/sync/{iamId}` — there is deliberately no list endpoint, no PUT, and no by-local-id delete.
 - `POST /users` binds `UserSyncDto` (`[JsonPropertyName("iam_id")]` — default binding would silently drop the snake_case key) and is **idempotent**: an already-synced `IamId` returns `200` with the existing row.
-- User deletion explicitly deletes the user's notes (`RemoveUserWithNotesAsync`) since there is no FK cascade.
+  A taken username under a *different* `IamId` returns `409` — that means the mirror is stale (missed deletion sync); reconcile with the sync script.
+- User deletion cascades to the user's notes at the database level (FK `ON DELETE CASCADE`).
 - Backfill/reconciliation: `midden-infra/scripts/sync-users.js` pulls the user list from iam's api-key-guarded `GET /users/sync` and pushes each user here; safe to re-run.
 
 ## Note permissions
@@ -91,14 +96,15 @@ The ownership model:
   (If note sharing is ever built, "not yours" could become read-only instead — but sharing is **not on the roadmap right now**.)
 - This is unrelated to the `role`/`permissions` claims `iam-service` puts on the JWT — those describe IAM-level roles, not note-level ownership, and don't factor into note access.
 
-How the caller is resolved (`GetCurrentUserAsync` in `Controllers/Note.cs`): the JWT's `id` claim (the IAM user's UUID) → local `Users` row via `User.IamId` → `User.Id.ToString()` compared against `Note.UserId`.
+How the caller is resolved (`GetCurrentUserAsync` in `Controllers/Note.cs`): the JWT's `id` claim (the IAM user's UUID) → local `Users` row via `User.IamId` → `User.Id` compared against `Note.UserId`.
 No row means `403` (see the user-sync section above).
 
 Enforcement conventions:
 
 - `GET`/`PUT`/`DELETE` on someone else's note returns **404, not 403**, so callers can't probe which note ids exist.
-- `POST /notes` ignores any client-supplied `UserId` and stamps the caller's — same for `Id` and `CreatedAt`.
-- `GET /notes` returns only the caller's notes; `GET /notes/user/{userId}` returns 403 unless `userId` is the caller's own.
+- `POST /notes` binds only `title`/`content` (`NoteCreateDto`) — `Id`, `UserId`, and `CreatedAt` are stamped server-side and extra JSON keys are ignored.
+- `GET /notes` returns only the caller's notes.
+  (The old `GET /notes/user/{userId}` was redundant with it and was removed; the frontend never used it.)
 
 ## Deployment
 
