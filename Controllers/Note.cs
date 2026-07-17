@@ -17,13 +17,19 @@ public record NoteUpdateDto(
     [MaxLength(100_000)] string Content
 );
 
+// One page of results plus the counts the client needs to render pagination.
+public record PagedResult<T>(IEnumerable<T> Items, int Page, int PageSize, int Total, int TotalPages);
+
 [ApiController]
 [Route("[controller]")]
 [Authorize]
 public class NotesController(NetbookDbContext context) : ControllerBase
 {
     [HttpGet]
-    public async Task<ActionResult<IEnumerable<Note>>> GetNotes()
+    public async Task<ActionResult<PagedResult<Note>>> GetNotes(
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 10
+    )
     {
         var user = await GetCurrentUserAsync();
         if (user == null)
@@ -31,7 +37,22 @@ public class NotesController(NetbookDbContext context) : ControllerBase
             return Forbid();
         }
 
-        return await context.Notes.Where(n => n.UserId == user.Id).ToListAsync();
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 50);
+
+        // Newest first, ordered server-side so pages are stable across requests.
+        var query = context.Notes
+            .Where(n => n.UserId == user.Id)
+            .OrderByDescending(n => n.CreatedAt);
+
+        var total = await query.CountAsync();
+        var items = await query
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync();
+
+        var totalPages = (int)Math.Ceiling(total / (double)pageSize);
+        return new PagedResult<Note>(items, page, pageSize, total, totalPages);
     }
 
     [HttpGet("{id}")]

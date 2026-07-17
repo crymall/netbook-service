@@ -103,8 +103,8 @@ Enforcement conventions:
 
 - `GET`/`PUT`/`DELETE` on someone else's note returns **404, not 403**, so callers can't probe which note ids exist.
 - `POST /notes` binds only `title`/`content` (`NoteCreateDto`) — `Id`, `UserId`, and `CreatedAt` are stamped server-side and extra JSON keys are ignored.
-- `GET /notes` returns only the caller's notes.
-  (The old `GET /notes/user/{userId}` was redundant with it and was removed; the frontend never used it.)
+- `GET /notes` returns only the caller's notes, **paginated**: query params `page` (default 1, clamped `>= 1`) and `pageSize` (default 10, clamped to `[1, 50]`), newest first. The response is a `PagedResult<Note>` — `{ items, page, pageSize, total, totalPages }` — not a bare array. Ordering is server-side so pages stay stable; an out-of-range page returns empty `items` with the real `total`.
+  (The old `GET /notes/user/{userId}` was redundant and removed; the frontend never used it.)
 
 ## Deployment
 
