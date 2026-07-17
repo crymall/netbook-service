@@ -4,6 +4,9 @@ using netbook_service.Models;
 
 namespace netbook_service.Tests;
 
+// Mirrors the controller's PagedResult<Note> for deserialization.
+public record PagedNotes(List<Note> Items, int Page, int PageSize, int Total, int TotalPages);
+
 public class NotesTests(TestWebApplicationFactory factory)
     : IClassFixture<TestWebApplicationFactory>
 {
@@ -12,6 +15,16 @@ public class NotesTests(TestWebApplicationFactory factory)
         var user = await TestHelpers.SyncUserAsync(factory, Guid.NewGuid(), username);
         var client = factory.CreateClient().WithBearer(user.IamId, user.Username);
         return (client, user);
+    }
+
+    private static async Task CreateNotesAsync(HttpClient client, int count, string prefix)
+    {
+        for (var i = 0; i < count; i++)
+        {
+            var response = await client.PostAsJsonAsync(
+                "/notes", new { title = $"{prefix} {i:D2}", content = $"body {i}" });
+            response.EnsureSuccessStatusCode();
+        }
     }
 
     [Fact]
@@ -64,10 +77,70 @@ public class NotesTests(TestWebApplicationFactory factory)
             await alice.PostAsJsonAsync("/notes", new { title = "alice note", content = "a" });
             await bob.PostAsJsonAsync("/notes", new { title = "bob note", content = "b" });
 
-            var aliceNotes = (await alice.GetFromJsonAsync<List<Note>>("/notes"))!;
-            Assert.All(aliceNotes, n => Assert.Equal("alice note", n.Title));
-            Assert.Single(aliceNotes);
+            var aliceNotes = (await alice.GetFromJsonAsync<PagedNotes>("/notes"))!;
+            Assert.Equal(1, aliceNotes.Total);
+            Assert.All(aliceNotes.Items, n => Assert.Equal("alice note", n.Title));
         }
+    }
+
+    [Fact]
+    public async Task GetNotes_PaginatesAndReportsTotals()
+    {
+        var (client, _) = await AuthedClientAsync("paginator");
+        using var _c = client;
+        await CreateNotesAsync(client, 12, "note");
+
+        var page1 = (await client.GetFromJsonAsync<PagedNotes>("/notes?page=1&pageSize=10"))!;
+        Assert.Equal(12, page1.Total);
+        Assert.Equal(2, page1.TotalPages);
+        Assert.Equal(1, page1.Page);
+        Assert.Equal(10, page1.Items.Count);
+
+        var page2 = (await client.GetFromJsonAsync<PagedNotes>("/notes?page=2&pageSize=10"))!;
+        Assert.Equal(2, page2.Items.Count);
+        Assert.Equal(2, page2.Page);
+
+        // No note appears on both pages.
+        var overlap = page1.Items.Select(n => n.Id).Intersect(page2.Items.Select(n => n.Id));
+        Assert.Empty(overlap);
+    }
+
+    [Fact]
+    public async Task GetNotes_OrdersNewestFirst()
+    {
+        var (client, _) = await AuthedClientAsync("chronologist");
+        using var _c = client;
+        await CreateNotesAsync(client, 3, "note");
+
+        var page = (await client.GetFromJsonAsync<PagedNotes>("/notes"))!;
+        var timestamps = page.Items.Select(n => n.CreatedAt).ToList();
+        Assert.Equal(timestamps.OrderByDescending(t => t), timestamps);
+    }
+
+    [Fact]
+    public async Task GetNotes_ClampsPageSize()
+    {
+        var (client, _) = await AuthedClientAsync("greedy");
+        using var _c = client;
+        await CreateNotesAsync(client, 3, "note");
+
+        // pageSize above the cap is clamped to 50 (still returns all 3 here).
+        var page = (await client.GetFromJsonAsync<PagedNotes>("/notes?pageSize=9999"))!;
+        Assert.Equal(50, page.PageSize);
+        Assert.Equal(3, page.Items.Count);
+    }
+
+    [Fact]
+    public async Task GetNotes_OutOfRangePage_ReturnsEmptyWithRealTotal()
+    {
+        var (client, _) = await AuthedClientAsync("overshooter");
+        using var _c = client;
+        await CreateNotesAsync(client, 3, "note");
+
+        var page = (await client.GetFromJsonAsync<PagedNotes>("/notes?page=99&pageSize=10"))!;
+        Assert.Empty(page.Items);
+        Assert.Equal(3, page.Total);
+        Assert.Equal(1, page.TotalPages);
     }
 
     [Fact]

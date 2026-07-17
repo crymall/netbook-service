@@ -118,8 +118,8 @@ public class UsersSyncTests(TestWebApplicationFactory factory)
 
         var resynced = await TestHelpers.SyncUserAsync(factory, user.IamId, user.Username);
         using var reAuthed = factory.CreateClient().WithBearer(resynced.IamId, resynced.Username);
-        var notes = (await reAuthed.GetFromJsonAsync<List<Note>>("/notes"))!;
-        Assert.Empty(notes);
+        var notes = (await reAuthed.GetFromJsonAsync<PagedNotes>("/notes"))!;
+        Assert.Empty(notes.Items);
     }
 
     [Fact]
