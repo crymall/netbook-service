@@ -102,8 +102,16 @@ No row means `403` (see the user-sync section above).
 Enforcement conventions:
 
 - `GET`/`PUT`/`DELETE` on someone else's note returns **404, not 403**, so callers can't probe which note ids exist.
-- `POST /notes` binds only `title`/`content` (`NoteCreateDto`) — `Id`, `UserId`, and `CreatedAt` are stamped server-side and extra JSON keys are ignored.
-- `GET /notes` returns only the caller's notes, **paginated**: query params `page` (default 1, clamped `>= 1`) and `pageSize` (default 10, clamped to `[1, 50]`), newest first. The response is a `PagedResult<Note>` — `{ items, page, pageSize, total, totalPages }` — not a bare array. Ordering is server-side so pages stay stable; an out-of-range page returns empty `items` with the real `total`.
+- `POST /notes` binds only `title`/`content` (`NoteCreateDto`) — `Id`, `UserId`, `CreatedAt`, and `UpdatedAt` are stamped server-side and extra JSON keys are ignored.
+- **`UpdatedAt` lifecycle**: create stamps `UpdatedAt` equal to `CreatedAt`; `PUT /notes/{id}` refreshes it.
+  The column is nullable only for rows that predate it (the migration leaves existing rows null) — the API never writes null.
+  A successful PUT returns `200` with the updated note (not `204`), so a syncing client can base its next conditional write on the fresh `UpdatedAt` without a GET.
+- **Optimistic concurrency for offline sync**: `PUT /notes/{id}` and `DELETE /notes/{id}` accept an optional `updatedAt` in the JSON body — the timestamp of the copy the client based its change on.
+  Absent means unconditional (last writer wins, the pre-existing behavior); present means the write is rejected with `409` — body carrying the current server row for conflict resolution — when the stored `UpdatedAt` is *strictly newer* than the supplied value.
+  Strictly-newer rather than exact-match is deliberate: Postgres stores microseconds while JSON responses carry .NET's 100ns ticks, so exact equality would produce phantom conflicts when a client echoes a POST/PUT response value.
+  A null stored `UpdatedAt` (legacy row) is never newer, so conditional writes against legacy rows proceed.
+  DELETE's body is optional (`EmptyBodyBehavior.Allow`) — a bare DELETE with no body still works.
+- `GET /notes` returns only the caller's notes, **paginated**: query params `page` (default 1, clamped `>= 1`) and `pageSize` (default 10, clamped to `[1, 50]`), most recently updated first, null-`UpdatedAt` legacy rows last (explicitly bucketed — Postgres would otherwise put nulls first on `DESC`), newest-created first as the tiebreak. The response is a `PagedResult<Note>` — `{ items, page, pageSize, total, totalPages }` — not a bare array. Ordering is server-side so pages stay stable; an out-of-range page returns empty `items` with the real `total`.
   (The old `GET /notes/user/{userId}` was redundant and removed; the frontend never used it.)
 
 ## Deployment
