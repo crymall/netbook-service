@@ -8,19 +8,10 @@ using netbook_service.Models;
 
 namespace netbook_service.Controllers;
 
-// Write DTOs: clients only ever supply title/content (plus the id echo on
-// PUT). Id, UserId, and CreatedAt are server-owned and not bindable at all.
-// UpdatedAt on the update/delete DTOs is not a writable field either — it is
-// an optional optimistic-concurrency precondition for the offline-sync flush:
-// the timestamp of the copy the client based its change on. When present, a
-// stored UpdatedAt strictly newer than it means someone else wrote in
-// between, and the request is rejected with 409 plus the current row. When
-// absent, the write is unconditional (last writer wins), as before. The
-// comparison is strictly-newer rather than exact-match so that precision
-// truncation (Postgres stores microseconds; JSON responses carry .NET's
-// 100ns ticks) can't produce phantom conflicts.
 public record NoteCreateDto([MaxLength(200)] string Title, [MaxLength(100_000)] string Content);
 
+// UpdatedAt here is not a writable field: it is an optional optimistic-concurrency
+// precondition (the timestamp the client based its change on), checked by IsStale.
 public record NoteUpdateDto(
     Guid Id,
     [MaxLength(200)] string Title,
@@ -30,7 +21,6 @@ public record NoteUpdateDto(
 
 public record NoteDeleteDto(DateTime? UpdatedAt = null);
 
-// One page of results plus the counts the client needs to render pagination.
 public record PagedResult<T>(IEnumerable<T> Items, int Page, int PageSize, int Total, int TotalPages);
 
 [ApiController]
@@ -53,10 +43,8 @@ public class NotesController(NetbookDbContext context) : ControllerBase
         page = Math.Max(1, page);
         pageSize = Math.Clamp(pageSize, 1, 50);
 
-        // Most recently updated first, ordered server-side so pages are stable
-        // across requests. Pre-column rows have a null UpdatedAt and sort last
-        // (Postgres puts nulls first on DESC by default, hence the explicit
-        // null bucket), newest-created first within that tail.
+        // Most recently updated first; the leading null-bucket sort keeps legacy
+        // null-UpdatedAt rows last (Postgres orders nulls first on DESC otherwise).
         var query = context.Notes
             .Where(n => n.UserId == user.Id)
             .OrderBy(n => n.UpdatedAt == null)
@@ -84,8 +72,7 @@ public class NotesController(NetbookDbContext context) : ControllerBase
 
         var note = await context.Notes.FindAsync(id);
 
-        // Notes belonging to other users are reported as missing rather than
-        // forbidden, so callers can't probe which note ids exist.
+        // 404 rather than 403 on a foreign note, so callers can't probe which ids exist.
         if (note == null || note.UserId != user.Id)
         {
             return NotFound();
@@ -151,9 +138,7 @@ public class NotesController(NetbookDbContext context) : ControllerBase
 
         await context.SaveChangesAsync();
 
-        // The updated row (with its fresh UpdatedAt) goes back in the body so
-        // a syncing client can base its next conditional write on this one
-        // without an extra GET.
+        // Returns the row so a syncing client gets the fresh UpdatedAt for its next write.
         return existingNote;
     }
 
@@ -186,17 +171,13 @@ public class NotesController(NetbookDbContext context) : ControllerBase
         return NoContent();
     }
 
-    // The optional precondition (see the DTO comment): stale only when the
-    // caller supplied a base timestamp and the stored note has been written
-    // since. A null stored UpdatedAt (pre-column legacy row) is never newer,
-    // so conditional writes against legacy rows always proceed.
+    // Strictly-newer, not exact-match: Postgres truncates to microseconds while
+    // JSON carries .NET's 100ns ticks, so an echoed value would falsely mismatch.
     private static bool IsStale(Note note, DateTime? baseUpdatedAt) =>
         baseUpdatedAt != null && note.UpdatedAt > baseUpdatedAt;
 
-    // Resolves the caller to a local User row via the "id" claim iam-service
-    // puts in the JWT, which holds the IAM user's UUID (User.IamId here).
-    // Rows are created only by iam-service's register-time push and the
-    // sync-users backfill script — a valid JWT with no local row gets 403.
+    // The JWT "id" claim is the IAM user's UUID (User.IamId). No local row means
+    // the caller is unresolved; every action treats that as 403.
     private async Task<User?> GetCurrentUserAsync()
     {
         var iamIdClaim = User.FindFirstValue("id");

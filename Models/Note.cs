@@ -14,8 +14,7 @@ public class Note
 
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 
-    // Null only for rows that predate the column; the API always stamps it
-    // (equal to CreatedAt on create, refreshed on every update).
+    // Null only for rows that predate the column; the API always stamps it.
     public DateTime? UpdatedAt { get; set; }
 
     public int UserId { get; set; }

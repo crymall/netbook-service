@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Code style
+
+Prefer semantically-named identifiers and readable logic over comments.
+Add a comment only when it is critically necessary — to flag an unusual pattern, a non-obvious constraint, or a deliberate choice that would otherwise read as a bug (e.g. why `IsStale` compares strictly-newer rather than exact-match).
+Do not write comments that restate what the code, its names, or an adjacent assertion already make clear.
+
 ## Project overview
 
 `netbook-service` is the backend API for a notes app, written in C# / ASP.NET Core (.NET 10).
