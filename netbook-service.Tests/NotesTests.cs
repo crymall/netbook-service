@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using Microsoft.Extensions.DependencyInjection;
 using netbook_service.Models;
 
 namespace netbook_service.Tests;
@@ -43,6 +44,7 @@ public class NotesTests(TestWebApplicationFactory factory)
             content = "Eggs, flour",
             userId = 999,
             createdAt = new DateTime(2000, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+            updatedAt = new DateTime(2000, 1, 1, 0, 0, 0, DateTimeKind.Utc),
         });
 
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
@@ -50,6 +52,7 @@ public class NotesTests(TestWebApplicationFactory factory)
         Assert.NotEqual(forgedId, note.Id);
         Assert.Equal(user.Id, note.UserId);
         Assert.True(note.CreatedAt > DateTime.UtcNow.AddMinutes(-1));
+        Assert.Equal(note.CreatedAt, note.UpdatedAt);
         Assert.Equal("Groceries", note.Title);
     }
 
@@ -106,15 +109,54 @@ public class NotesTests(TestWebApplicationFactory factory)
     }
 
     [Fact]
-    public async Task GetNotes_OrdersNewestFirst()
+    public async Task GetNotes_OrdersMostRecentlyUpdatedFirst()
     {
         var (client, _) = await AuthedClientAsync("chronologist");
         using var _c = client;
         await CreateNotesAsync(client, 3, "note");
 
         var page = (await client.GetFromJsonAsync<PagedNotes>("/notes"))!;
-        var timestamps = page.Items.Select(n => n.CreatedAt).ToList();
+        var timestamps = page.Items.Select(n => n.UpdatedAt).ToList();
         Assert.Equal(timestamps.OrderByDescending(t => t), timestamps);
+
+        // Editing the oldest note moves it to the front of the list.
+        var oldest = page.Items.Last();
+        var update = await client.PutAsJsonAsync($"/notes/{oldest.Id}",
+            new { id = oldest.Id, title = oldest.Title, content = "edited" });
+        update.EnsureSuccessStatusCode();
+
+        var after = (await client.GetFromJsonAsync<PagedNotes>("/notes"))!;
+        Assert.Equal(oldest.Id, after.Items.First().Id);
+    }
+
+    [Fact]
+    public async Task GetNotes_NullUpdatedAt_SortsLast()
+    {
+        var (client, user) = await AuthedClientAsync("legacy_holder");
+        using var _c = client;
+        await CreateNotesAsync(client, 2, "note");
+
+        // A row from before the UpdatedAt column existed: inserted directly,
+        // since the API always stamps the field. Its CreatedAt is newer than
+        // the API-created notes', so only the null bucket can put it last.
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<NetbookDbContext>();
+            db.Notes.Add(new Note
+            {
+                Id = Guid.NewGuid(),
+                Title = "legacy",
+                Content = "pre-column row",
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = null,
+                UserId = user.Id,
+            });
+            await db.SaveChangesAsync();
+        }
+
+        var page = (await client.GetFromJsonAsync<PagedNotes>("/notes"))!;
+        Assert.Equal(3, page.Total);
+        Assert.Equal("legacy", page.Items.Last().Title);
     }
 
     [Fact]
@@ -178,12 +220,61 @@ public class NotesTests(TestWebApplicationFactory factory)
             var foreign = await other.PutAsJsonAsync($"/notes/{note.Id}", update);
             Assert.Equal(HttpStatusCode.NotFound, foreign.StatusCode);
 
+            // A successful PUT returns the updated row so a syncing client can
+            // base its next conditional write on it without an extra GET.
             var own = await owner.PutAsJsonAsync($"/notes/{note.Id}", update);
-            Assert.Equal(HttpStatusCode.NoContent, own.StatusCode);
+            Assert.Equal(HttpStatusCode.OK, own.StatusCode);
+            var updated = (await own.Content.ReadFromJsonAsync<Note>())!;
+            Assert.Equal("after", updated.Title);
+            Assert.True(updated.UpdatedAt > note.UpdatedAt);
 
             var fetched = (await owner.GetFromJsonAsync<Note>($"/notes/{note.Id}"))!;
             Assert.Equal("after", fetched.Title);
         }
+    }
+
+    [Fact]
+    public async Task PutNote_StaleUpdatedAt_Returns409WithCurrentNote()
+    {
+        var (client, _) = await AuthedClientAsync("conflict_put");
+        using var _c = client;
+        var created = await client.PostAsJsonAsync("/notes", new { title = "v1", content = "c1" });
+        var v1 = (await created.Content.ReadFromJsonAsync<Note>())!;
+
+        // Another writer bumps the note, so v1's timestamp becomes stale.
+        var second = await client.PutAsJsonAsync($"/notes/{v1.Id}",
+            new { id = v1.Id, title = "v2", content = "c2" });
+        var v2 = (await second.Content.ReadFromJsonAsync<Note>())!;
+
+        var conflicted = await client.PutAsJsonAsync($"/notes/{v1.Id}",
+            new { id = v1.Id, title = "stale", content = "s", updatedAt = v1.UpdatedAt });
+        Assert.Equal(HttpStatusCode.Conflict, conflicted.StatusCode);
+
+        // The 409 body carries the current server copy for conflict resolution.
+        var current = (await conflicted.Content.ReadFromJsonAsync<Note>())!;
+        Assert.Equal("v2", current.Title);
+        Assert.Equal(v2.UpdatedAt, current.UpdatedAt);
+
+        // The stale write did not land.
+        var fetched = (await client.GetFromJsonAsync<Note>($"/notes/{v1.Id}"))!;
+        Assert.Equal("v2", fetched.Title);
+    }
+
+    [Fact]
+    public async Task PutNote_CurrentUpdatedAt_Succeeds()
+    {
+        var (client, _) = await AuthedClientAsync("fresh_put");
+        using var _c = client;
+        var created = await client.PostAsJsonAsync("/notes", new { title = "v1", content = "c1" });
+        var note = (await created.Content.ReadFromJsonAsync<Note>())!;
+
+        // Echoing the timestamp the client last saw passes the precondition.
+        var response = await client.PutAsJsonAsync($"/notes/{note.Id}",
+            new { id = note.Id, title = "v2", content = "c2", updatedAt = note.UpdatedAt });
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var updated = (await response.Content.ReadFromJsonAsync<Note>())!;
+        Assert.Equal("v2", updated.Title);
+        Assert.True(updated.UpdatedAt > note.UpdatedAt);
     }
 
     [Fact]
@@ -216,6 +307,70 @@ public class NotesTests(TestWebApplicationFactory factory)
             var gone = await owner.GetAsync($"/notes/{note.Id}");
             Assert.Equal(HttpStatusCode.NotFound, gone.StatusCode);
         }
+    }
+
+    [Fact]
+    public async Task DeleteNote_StaleUpdatedAt_Returns409AndKeepsNote()
+    {
+        var (client, _) = await AuthedClientAsync("conflict_del");
+        using var _c = client;
+        var created = await client.PostAsJsonAsync("/notes", new { title = "v1", content = "c1" });
+        var v1 = (await created.Content.ReadFromJsonAsync<Note>())!;
+
+        var second = await client.PutAsJsonAsync($"/notes/{v1.Id}",
+            new { id = v1.Id, title = "v2", content = "c2" });
+        var v2 = (await second.Content.ReadFromJsonAsync<Note>())!;
+
+        // Deleting on a stale base is rejected and the note survives.
+        var conflicted = await DeleteWithBodyAsync(client, v1.Id, v1.UpdatedAt);
+        Assert.Equal(HttpStatusCode.Conflict, conflicted.StatusCode);
+        var current = (await conflicted.Content.ReadFromJsonAsync<Note>())!;
+        Assert.Equal("v2", current.Title);
+
+        var still = await client.GetAsync($"/notes/{v1.Id}");
+        Assert.Equal(HttpStatusCode.OK, still.StatusCode);
+
+        // With the current timestamp the delete goes through.
+        var fresh = await DeleteWithBodyAsync(client, v1.Id, v2.UpdatedAt);
+        Assert.Equal(HttpStatusCode.NoContent, fresh.StatusCode);
+    }
+
+    [Fact]
+    public async Task DeleteNote_ConditionalOnLegacyNullRow_Succeeds()
+    {
+        var (client, user) = await AuthedClientAsync("legacy_del");
+        using var _c = client;
+
+        // A pre-column row (null UpdatedAt) is never "newer" than the caller's
+        // base, so conditional deletes against legacy rows always proceed.
+        var legacyId = Guid.NewGuid();
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<NetbookDbContext>();
+            db.Notes.Add(new Note
+            {
+                Id = legacyId,
+                Title = "legacy",
+                Content = "pre-column row",
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = null,
+                UserId = user.Id,
+            });
+            await db.SaveChangesAsync();
+        }
+
+        var response = await DeleteWithBodyAsync(client, legacyId, DateTime.UtcNow);
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+    }
+
+    private static async Task<HttpResponseMessage> DeleteWithBodyAsync(
+        HttpClient client, Guid id, DateTime? updatedAt)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Delete, $"/notes/{id}")
+        {
+            Content = JsonContent.Create(new { updatedAt }),
+        };
+        return await client.SendAsync(request);
     }
 
     [Fact]

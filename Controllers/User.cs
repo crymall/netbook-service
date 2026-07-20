@@ -10,7 +10,7 @@ namespace netbook_service.Controllers;
 // The body iam-service sends when pushing a user (snake_case keys).
 public record UserSyncDto(
     [property: JsonPropertyName("iam_id")] Guid IamId,
-    [property: JsonPropertyName("username")] [MaxLength(50)] string Username
+    [property: JsonPropertyName("username")][MaxLength(50)] string Username
 );
 
 // This controller is a machine-to-machine sync surface for iam-service and
